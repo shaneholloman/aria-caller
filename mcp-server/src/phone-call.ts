@@ -48,7 +48,7 @@ export function loadConfig(): Config {
     userPhoneNumber: process.env.USER_PHONE_NUMBER!,
     openaiApiKey: process.env.OPENAI_API_KEY!,
     publicUrl: process.env.PUBLIC_URL!,
-    port: parseInt(process.env.PORT || '3000', 10),
+    port: parseInt(process.env.PORT || '3333', 10),
   };
 }
 
