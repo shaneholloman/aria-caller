@@ -38,6 +38,21 @@ Continue an active call with a follow-up message.
 **Returns:**
 - The user's response
 
+### `speak_to_user`
+Speak a message on an active call without waiting for a response. Use this to acknowledge requests or provide status updates before starting time-consuming operations.
+
+**Parameters:**
+- `call_id` (string): The call ID from `initiate_call`
+- `message` (string): What to say to the user
+
+**Returns:**
+- Confirmation that the message was spoken
+
+**When to use:**
+- Acknowledge a request before starting a long operation (e.g., "Let me search for that...")
+- Provide status updates during multi-step tasks
+- Keep the conversation flowing naturally without awkward silences
+
 ### `end_call`
 End an active call with a closing message.
 
@@ -66,9 +81,21 @@ End an active call with a closing message.
 5. end_call: "Awesome, I'll build the full Stripe checkout. I'll let you know when it's ready!"
 ```
 
+**Using speak_to_user for long operations:**
+```
+1. initiate_call: "Hey! I finished the database migration. What should I work on next?"
+2. User: "Can you look up the latest API documentation for Stripe?"
+3. speak_to_user: "Sure! Let me search for that. Give me a moment..."
+4. [Perform web search and gather information]
+5. continue_call: "I found the latest Stripe API docs. They released v2024.1 with new payment methods..."
+6. User: "Great, implement that"
+7. end_call: "Perfect! I'll implement the new payment methods. Talk soon!"
+```
+
 ## Best Practices
 
 1. **Be conversational** - Talk naturally, like a real conversation
 2. **Provide context** - Explain what you've done before asking questions
 3. **Offer clear options** - Make decisions easy with specific choices
-4. **Always end gracefully** - Say goodbye and state what you'll do next
+4. **Use speak_to_user for acknowledgments** - Before time-consuming operations (searches, file reads, etc.), use `speak_to_user` to acknowledge the request so the user isn't left wondering what's happening
+5. **Always end gracefully** - Say goodbye and state what you'll do next
