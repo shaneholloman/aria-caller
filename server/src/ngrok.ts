@@ -68,23 +68,29 @@ async function monitorTunnel(): Promise<void> {
     }
 
     // Check if listener is still valid
-    if (!listener) {
+    if (!listener || !currentUrl) {
       clearInterval(checkInterval);
       console.error('[ngrok] Tunnel lost, attempting reconnect...');
       attemptReconnect();
       return;
     }
 
+    // Actually verify the tunnel works by hitting the health endpoint
     try {
-      const url = listener.url();
-      if (!url) {
-        clearInterval(checkInterval);
-        console.error('[ngrok] Tunnel URL lost, attempting reconnect...');
-        attemptReconnect();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+
+      const response = await fetch(`${currentUrl}/health`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        throw new Error(`Health check returned ${response.status}`);
       }
     } catch (error) {
       clearInterval(checkInterval);
-      console.error('[ngrok] Tunnel check failed:', error);
+      console.error('[ngrok] Tunnel health check failed:', error);
       attemptReconnect();
     }
   }, 30000);  // Check every 30 seconds
