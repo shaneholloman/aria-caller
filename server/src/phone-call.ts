@@ -13,6 +13,7 @@ interface CallState {
   callControlId: string | null;
   userPhoneNumber: string;
   ws: WebSocket | null;
+  streamSid: string | null;  // Twilio media stream ID (required for sending audio)
   conversationHistory: Array<{ speaker: 'claude' | 'user'; message: string }>;
   startTime: number;
   hungUp: boolean;
@@ -118,6 +119,31 @@ export class CallManager {
           }
         }
 
+        // Parse JSON messages from Twilio to capture streamSid and handle events
+        if (msgBuffer.length > 0 && msgBuffer[0] === 0x7b) {
+          try {
+            const msg = JSON.parse(msgBuffer.toString());
+
+            // Capture streamSid from "start" event (required for sending audio back)
+            if (msg.event === 'start' && msg.streamSid && associatedCallId) {
+              const state = this.activeCalls.get(associatedCallId);
+              if (state) {
+                state.streamSid = msg.streamSid;
+                console.error(`[${associatedCallId}] Captured streamSid: ${msg.streamSid}`);
+              }
+            }
+
+            // Handle "stop" event when call ends
+            if (msg.event === 'stop' && associatedCallId) {
+              const state = this.activeCalls.get(associatedCallId);
+              if (state) {
+                console.error(`[${associatedCallId}] Stream stopped`);
+                state.hungUp = true;
+              }
+            }
+          } catch {}
+        }
+
         // Forward audio to realtime transcription session
         if (associatedCallId) {
           const state = this.activeCalls.get(associatedCallId);
@@ -168,6 +194,7 @@ export class CallManager {
   private handlePhoneWebhook(req: IncomingMessage, res: ServerResponse): void {
     const contentType = req.headers['content-type'] || '';
 
+    // Telnyx sends JSON webhooks
     if (contentType.includes('application/json')) {
       let body = '';
       req.on('data', (chunk) => { body += chunk; });
@@ -184,7 +211,56 @@ export class CallManager {
       return;
     }
 
-    // XML response for media stream connection
+    // Twilio sends form-urlencoded webhooks
+    if (contentType.includes('application/x-www-form-urlencoded')) {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const params = new URLSearchParams(body);
+          await this.handleTwilioWebhook(params, res);
+        } catch (error) {
+          console.error('Error parsing Twilio webhook:', error);
+          res.writeHead(400);
+          res.end('Invalid form data');
+        }
+      });
+      return;
+    }
+
+    // Fallback: Return TwiML for media stream connection
+    const streamUrl = `wss://${new URL(this.config.publicUrl).host}/media-stream`;
+    const xml = this.config.providers.phone.getStreamConnectXml(streamUrl);
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end(xml);
+  }
+
+  private async handleTwilioWebhook(params: URLSearchParams, res: ServerResponse): Promise<void> {
+    const callSid = params.get('CallSid');
+    const callStatus = params.get('CallStatus');
+
+    console.error(`Twilio webhook: CallSid=${callSid}, CallStatus=${callStatus}`);
+
+    // Handle call status updates
+    if (callStatus === 'completed' || callStatus === 'busy' || callStatus === 'no-answer' || callStatus === 'failed') {
+      // Call ended - find and mark as hung up
+      if (callSid) {
+        const callId = this.callControlIdToCallId.get(callSid);
+        if (callId) {
+          this.callControlIdToCallId.delete(callSid);
+          const state = this.activeCalls.get(callId);
+          if (state) {
+            state.hungUp = true;
+            state.ws?.close();
+          }
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/xml' });
+      res.end('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+      return;
+    }
+
+    // For 'in-progress' or 'ringing' status, return TwiML to start media stream
     const streamUrl = `wss://${new URL(this.config.publicUrl).host}/media-stream`;
     const xml = this.config.providers.phone.getStreamConnectXml(streamUrl);
     res.writeHead(200, { 'Content-Type': 'application/xml' });
@@ -253,6 +329,7 @@ export class CallManager {
       callControlId: null,
       userPhoneNumber: this.config.userPhoneNumber,
       ws: null,
+      streamSid: null,
       conversationHistory: [],
       startTime: Date.now(),
       hungUp: false,
@@ -273,9 +350,16 @@ export class CallManager {
 
       console.error(`Call initiated: ${callControlId} -> ${this.config.userPhoneNumber}`);
 
+      // Start TTS generation in parallel with waiting for connection
+      // This reduces latency by generating audio while Twilio establishes the stream
+      const ttsPromise = this.generateTTSAudio(message);
+
       await this.waitForConnection(callId, 15000);
 
-      const response = await this.speakAndListen(state, message);
+      // Send the pre-generated audio and listen for response
+      const audioData = await ttsPromise;
+      await this.sendPreGeneratedAudio(state, audioData);
+      const response = await this.listen(state);
       state.conversationHistory.push({ speaker: 'claude', message });
       state.conversationHistory.push({ speaker: 'user', message: response });
 
@@ -332,12 +416,49 @@ export class CallManager {
     const startTime = Date.now();
     while (Date.now() - startTime < timeout) {
       const state = this.activeCalls.get(callId);
-      if (state?.ws && state.ws.readyState === WebSocket.OPEN) {
+      // Wait for both WebSocket connection AND streamSid (needed for sending audio)
+      if (state?.ws && state.ws.readyState === WebSocket.OPEN && state.streamSid) {
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error('WebSocket connection timeout');
+  }
+
+  /**
+   * Pre-generate TTS audio (can run in parallel with connection setup)
+   * Returns mu-law encoded audio ready to send to Twilio
+   */
+  private async generateTTSAudio(text: string): Promise<Buffer> {
+    console.error(`[TTS] Generating audio for: ${text.substring(0, 50)}...`);
+    const tts = this.config.providers.tts;
+    const pcmData = await tts.synthesize(text);
+    const resampledPcm = this.resample24kTo8k(pcmData);
+    const muLawData = this.pcmToMuLaw(resampledPcm);
+    console.error(`[TTS] Audio generated: ${muLawData.length} bytes`);
+    return muLawData;
+  }
+
+  /**
+   * Send pre-generated mu-law audio to the call
+   */
+  private async sendPreGeneratedAudio(state: CallState, muLawData: Buffer): Promise<void> {
+    console.error(`[${state.callId}] Sending pre-generated audio...`);
+    const chunkSize = 160;  // 20ms at 8kHz
+    for (let i = 0; i < muLawData.length; i += chunkSize) {
+      const chunk = muLawData.subarray(i, i + chunkSize);
+      if (state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
+        state.ws.send(JSON.stringify({
+          event: 'media',
+          streamSid: state.streamSid,
+          media: { payload: chunk.toString('base64') },
+        }));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 18));
+    }
+    // Small delay to ensure audio finishes playing before listening
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    console.error(`[${state.callId}] Audio sent`);
   }
 
   private async speakAndListen(state: CallState, text: string): Promise<string> {
@@ -358,7 +479,7 @@ export class CallManager {
       await this.sendAudio(state, pcmData);
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 150));
     console.error(`[${state.callId}] Speaking done`);
   }
 
@@ -389,9 +510,10 @@ export class CallManager {
           const audioChunk = pendingMuLaw.subarray(0, OUTPUT_CHUNK_SIZE);
           pendingMuLaw = pendingMuLaw.subarray(OUTPUT_CHUNK_SIZE);
 
-          if (state.ws?.readyState === WebSocket.OPEN) {
+          if (state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
             state.ws.send(JSON.stringify({
               event: 'media',
+              streamSid: state.streamSid,
               media: { payload: audioChunk.toString('base64') },
             }));
           }
@@ -401,9 +523,10 @@ export class CallManager {
     }
 
     // Send remaining audio
-    if (pendingMuLaw.length > 0 && state.ws?.readyState === WebSocket.OPEN) {
+    if (pendingMuLaw.length > 0 && state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
       state.ws.send(JSON.stringify({
         event: 'media',
+        streamSid: state.streamSid,
         media: { payload: pendingMuLaw.toString('base64') },
       }));
     }
@@ -416,9 +539,10 @@ export class CallManager {
     const chunkSize = 160;
     for (let i = 0; i < muLawData.length; i += chunkSize) {
       const chunk = muLawData.subarray(i, i + chunkSize);
-      if (state.ws?.readyState === WebSocket.OPEN) {
+      if (state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
         state.ws.send(JSON.stringify({
           event: 'media',
+          streamSid: state.streamSid,
           media: { payload: chunk.toString('base64') },
         }));
       }
@@ -433,7 +557,11 @@ export class CallManager {
       throw new Error('STT session not available');
     }
 
-    const transcript = await state.sttSession.waitForTranscript(this.config.transcriptTimeoutMs);
+    // Race between getting a transcript and detecting hangup
+    const transcript = await Promise.race([
+      state.sttSession.waitForTranscript(this.config.transcriptTimeoutMs),
+      this.waitForHangup(state),
+    ]);
 
     if (state.hungUp) {
       throw new Error('Call was hung up by user');
@@ -441,6 +569,26 @@ export class CallManager {
 
     console.error(`[${state.callId}] User said: ${transcript}`);
     return transcript;
+  }
+
+  /**
+   * Returns a promise that rejects when the call is hung up.
+   * Used to race against transcript waiting.
+   */
+  private waitForHangup(state: CallState): Promise<never> {
+    return new Promise((_, reject) => {
+      const checkInterval = setInterval(() => {
+        if (state.hungUp) {
+          clearInterval(checkInterval);
+          reject(new Error('Call was hung up by user'));
+        }
+      }, 100);  // Check every 100ms
+
+      // Clean up interval after transcript timeout to avoid memory leaks
+      setTimeout(() => {
+        clearInterval(checkInterval);
+      }, this.config.transcriptTimeoutMs + 1000);
+    });
   }
 
   private resample24kTo8k(pcmData: Buffer): Buffer {
