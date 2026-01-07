@@ -26,6 +26,10 @@ export interface ProviderConfig {
   phoneAuthToken: string;
   phoneNumber: string;
 
+  // Telnyx webhook public key (for signature verification)
+  // Get from: Mission Control > Account Settings > Keys & Credentials > Public Key
+  telnyxPublicKey?: string;
+
   // OpenAI (TTS + STT)
   openaiApiKey: string;
   ttsVoice?: string;
@@ -46,6 +50,7 @@ export function loadProviderConfig(): ProviderConfig {
     phoneAccountSid: process.env.CALLME_PHONE_ACCOUNT_SID || '',
     phoneAuthToken: process.env.CALLME_PHONE_AUTH_TOKEN || '',
     phoneNumber: process.env.CALLME_PHONE_NUMBER || '',
+    telnyxPublicKey: process.env.CALLME_TELNYX_PUBLIC_KEY,
     openaiApiKey: process.env.CALLME_OPENAI_API_KEY || '',
     ttsVoice: process.env.CALLME_TTS_VOICE || 'onyx',
     sttModel: process.env.CALLME_STT_MODEL || 'gpt-4o-transcribe',

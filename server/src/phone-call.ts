@@ -5,8 +5,15 @@ import {
   createProviders,
   validateProviderConfig,
   type ProviderRegistry,
+  type ProviderConfig,
   type RealtimeSTTSession,
 } from './providers/index.js';
+import {
+  validateTwilioSignature,
+  validateTelnyxSignature,
+  generateWebSocketToken,
+  validateWebSocketToken,
+} from './webhook-security.js';
 
 interface CallState {
   callId: string;
@@ -14,6 +21,8 @@ interface CallState {
   userPhoneNumber: string;
   ws: WebSocket | null;
   streamSid: string | null;  // Twilio media stream ID (required for sending audio)
+  streamingReady: boolean;  // True when streaming.started event received (Telnyx)
+  wsToken: string;  // Security token for WebSocket authentication
   conversationHistory: Array<{ speaker: 'claude' | 'user'; message: string }>;
   startTime: number;
   hungUp: boolean;
@@ -26,6 +35,7 @@ export interface ServerConfig {
   phoneNumber: string;
   userPhoneNumber: string;
   providers: ProviderRegistry;
+  providerConfig: ProviderConfig;  // For webhook signature verification
   transcriptTimeoutMs: number;
 }
 
@@ -52,6 +62,7 @@ export function loadServerConfig(publicUrl: string): ServerConfig {
     phoneNumber: providerConfig.phoneNumber,
     userPhoneNumber: process.env.CALLME_USER_PHONE_NUMBER!,
     providers,
+    providerConfig,
     transcriptTimeoutMs,
   };
 }
@@ -59,6 +70,7 @@ export function loadServerConfig(publicUrl: string): ServerConfig {
 export class CallManager {
   private activeCalls = new Map<string, CallState>();
   private callControlIdToCallId = new Map<string, string>();
+  private wsTokenToCallId = new Map<string, string>();  // For WebSocket auth
   private httpServer: ReturnType<typeof createServer> | null = null;
   private wss: WebSocketServer | null = null;
   private config: ServerConfig;
@@ -92,66 +104,73 @@ export class CallManager {
     this.httpServer.on('upgrade', (request: IncomingMessage, socket: any, head: Buffer) => {
       const url = new URL(request.url!, `http://${request.headers.host}`);
       if (url.pathname === '/media-stream') {
+        // Validate WebSocket token before allowing connection
+        const token = url.searchParams.get('token');
+        const callId = token ? this.wsTokenToCallId.get(token) : null;
+
+        if (!token || !callId) {
+          console.error('[Security] Rejecting WebSocket: missing or invalid token');
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
+        const state = this.activeCalls.get(callId);
+        if (!state || !validateWebSocketToken(state.wsToken, token)) {
+          console.error('[Security] Rejecting WebSocket: token validation failed');
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
+        // Token valid - proceed with upgrade
+        console.error(`[Security] WebSocket token validated for call ${callId}`);
         this.wss!.handleUpgrade(request, socket, head, (ws) => {
-          this.wss!.emit('connection', ws, request);
+          this.wss!.emit('connection', ws, request, callId);
         });
       } else {
         socket.destroy();
       }
     });
 
-    this.wss.on('connection', (ws: WebSocket) => {
-      console.error('Media stream WebSocket connected');
-      let associatedCallId: string | null = null;
+    this.wss.on('connection', (ws: WebSocket, _request: IncomingMessage, callId: string) => {
+      console.error(`Media stream WebSocket connected for call ${callId}`);
+
+      // Associate the WebSocket with the call immediately (token already validated)
+      const state = this.activeCalls.get(callId);
+      if (state) {
+        state.ws = ws;
+      }
 
       ws.on('message', (message: Buffer | string) => {
         const msgBuffer = Buffer.isBuffer(message) ? message : Buffer.from(message);
-
-        // Try to associate with a call if not already
-        if (!associatedCallId) {
-          for (const [callId, state] of this.activeCalls.entries()) {
-            if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-              state.ws = ws;
-              associatedCallId = callId;
-              console.error(`Associated WebSocket with call ${callId}`);
-              break;
-            }
-          }
-        }
 
         // Parse JSON messages from Twilio to capture streamSid and handle events
         if (msgBuffer.length > 0 && msgBuffer[0] === 0x7b) {
           try {
             const msg = JSON.parse(msgBuffer.toString());
+            const msgState = this.activeCalls.get(callId);
 
             // Capture streamSid from "start" event (required for sending audio back)
-            if (msg.event === 'start' && msg.streamSid && associatedCallId) {
-              const state = this.activeCalls.get(associatedCallId);
-              if (state) {
-                state.streamSid = msg.streamSid;
-                console.error(`[${associatedCallId}] Captured streamSid: ${msg.streamSid}`);
-              }
+            if (msg.event === 'start' && msg.streamSid && msgState) {
+              msgState.streamSid = msg.streamSid;
+              console.error(`[${callId}] Captured streamSid: ${msg.streamSid}`);
             }
 
             // Handle "stop" event when call ends
-            if (msg.event === 'stop' && associatedCallId) {
-              const state = this.activeCalls.get(associatedCallId);
-              if (state) {
-                console.error(`[${associatedCallId}] Stream stopped`);
-                state.hungUp = true;
-              }
+            if (msg.event === 'stop' && msgState) {
+              console.error(`[${callId}] Stream stopped`);
+              msgState.hungUp = true;
             }
           } catch {}
         }
 
         // Forward audio to realtime transcription session
-        if (associatedCallId) {
-          const state = this.activeCalls.get(associatedCallId);
-          if (state?.sttSession) {
-            const audioData = this.extractInboundAudio(msgBuffer);
-            if (audioData) {
-              state.sttSession.sendAudio(audioData);
-            }
+        const audioState = this.activeCalls.get(callId);
+        if (audioState?.sttSession) {
+          const audioData = this.extractInboundAudio(msgBuffer);
+          if (audioData) {
+            audioState.sttSession.sendAudio(audioData);
           }
         }
       });
@@ -200,6 +219,22 @@ export class CallManager {
       req.on('data', (chunk) => { body += chunk; });
       req.on('end', async () => {
         try {
+          // Validate Telnyx signature if public key is configured
+          const telnyxPublicKey = this.config.providerConfig.telnyxPublicKey;
+          if (telnyxPublicKey) {
+            const signature = req.headers['telnyx-signature-ed25519'] as string | undefined;
+            const timestamp = req.headers['telnyx-timestamp'] as string | undefined;
+
+            if (!validateTelnyxSignature(telnyxPublicKey, signature, timestamp, body)) {
+              console.error('[Security] Rejecting Telnyx webhook: invalid signature');
+              res.writeHead(401);
+              res.end('Invalid signature');
+              return;
+            }
+          } else {
+            console.error('[Security] Warning: CALLME_TELNYX_PUBLIC_KEY not set, skipping signature verification');
+          }
+
           const event = JSON.parse(body);
           await this.handleTelnyxWebhook(event, res);
         } catch (error) {
@@ -218,6 +253,22 @@ export class CallManager {
       req.on('end', async () => {
         try {
           const params = new URLSearchParams(body);
+
+          // Validate Twilio signature
+          const authToken = this.config.providerConfig.phoneAuthToken;
+          const signature = req.headers['x-twilio-signature'] as string | undefined;
+          // Reconstruct the URL Twilio used (handle ngrok SSL termination)
+          const protocol = req.headers['x-forwarded-proto'] || 'https';
+          const host = req.headers['host'] || new URL(this.config.publicUrl).host;
+          const webhookUrl = `${protocol}://${host}${req.url}`;
+
+          if (!validateTwilioSignature(authToken, signature, webhookUrl, params)) {
+            console.error('[Security] Rejecting Twilio webhook: invalid signature');
+            res.writeHead(401);
+            res.end('Invalid signature');
+            return;
+          }
+
           await this.handleTwilioWebhook(params, res);
         } catch (error) {
           console.error('Error parsing Twilio webhook:', error);
@@ -228,11 +279,10 @@ export class CallManager {
       return;
     }
 
-    // Fallback: Return TwiML for media stream connection
-    const streamUrl = `wss://${new URL(this.config.publicUrl).host}/media-stream`;
-    const xml = this.config.providers.phone.getStreamConnectXml(streamUrl);
-    res.writeHead(200, { 'Content-Type': 'application/xml' });
-    res.end(xml);
+    // Fallback: Reject unknown content types
+    console.error('[Security] Rejecting webhook with unknown content type:', contentType);
+    res.writeHead(400);
+    res.end('Invalid content type');
   }
 
   private async handleTwilioWebhook(params: URLSearchParams, res: ServerResponse): Promise<void> {
@@ -261,7 +311,20 @@ export class CallManager {
     }
 
     // For 'in-progress' or 'ringing' status, return TwiML to start media stream
-    const streamUrl = `wss://${new URL(this.config.publicUrl).host}/media-stream`;
+    // Include security token in the stream URL
+    let streamUrl = `wss://${new URL(this.config.publicUrl).host}/media-stream`;
+
+    // Find the call state to get the WebSocket token
+    if (callSid) {
+      const callId = this.callControlIdToCallId.get(callSid);
+      if (callId) {
+        const state = this.activeCalls.get(callId);
+        if (state) {
+          streamUrl += `?token=${encodeURIComponent(state.wsToken)}`;
+        }
+      }
+    }
+
     const xml = this.config.providers.phone.getStreamConnectXml(streamUrl);
     res.writeHead(200, { 'Content-Type': 'application/xml' });
     res.end(xml);
@@ -285,19 +348,27 @@ export class CallManager {
           break;
 
         case 'call.answered':
-          const streamUrl = `wss://${new URL(this.config.publicUrl).host}/media-stream`;
+          // Include security token in the stream URL
+          let streamUrl = `wss://${new URL(this.config.publicUrl).host}/media-stream`;
+          const callId = this.callControlIdToCallId.get(callControlId);
+          if (callId) {
+            const state = this.activeCalls.get(callId);
+            if (state) {
+              streamUrl += `?token=${encodeURIComponent(state.wsToken)}`;
+            }
+          }
           await this.config.providers.phone.startStreaming(callControlId, streamUrl);
           console.error(`Started streaming for call ${callControlId}`);
           break;
 
         case 'call.hangup':
-          const callId = this.callControlIdToCallId.get(callControlId);
-          if (callId) {
+          const hangupCallId = this.callControlIdToCallId.get(callControlId);
+          if (hangupCallId) {
             this.callControlIdToCallId.delete(callControlId);
-            const state = this.activeCalls.get(callId);
-            if (state) {
-              state.hungUp = true;
-              state.ws?.close();
+            const hangupState = this.activeCalls.get(hangupCallId);
+            if (hangupState) {
+              hangupState.hungUp = true;
+              hangupState.ws?.close();
             }
           }
           break;
@@ -308,6 +379,16 @@ export class CallManager {
           break;
 
         case 'streaming.started':
+          const streamCallId = this.callControlIdToCallId.get(callControlId);
+          if (streamCallId) {
+            const streamState = this.activeCalls.get(streamCallId);
+            if (streamState) {
+              streamState.streamingReady = true;
+              console.error(`[${streamCallId}] Streaming ready`);
+            }
+          }
+          break;
+
         case 'streaming.stopped':
           break;
       }
@@ -324,12 +405,17 @@ export class CallManager {
     await sttSession.connect();
     console.error(`[${callId}] STT session connected`);
 
+    // Generate secure token for WebSocket authentication
+    const wsToken = generateWebSocketToken();
+
     const state: CallState = {
       callId,
       callControlId: null,
       userPhoneNumber: this.config.userPhoneNumber,
       ws: null,
       streamSid: null,
+      streamingReady: false,
+      wsToken,
       conversationHistory: [],
       startTime: Date.now(),
       hungUp: false,
@@ -347,6 +433,7 @@ export class CallManager {
 
       state.callControlId = callControlId;
       this.callControlIdToCallId.set(callControlId, callId);
+      this.wsTokenToCallId.set(wsToken, callId);
 
       console.error(`Call initiated: ${callControlId} -> ${this.config.userPhoneNumber}`);
 
@@ -396,15 +483,24 @@ export class CallManager {
 
     await this.speak(state, message);
 
+    // Wait for audio to finish playing before hanging up (prevent cutoff)
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
     // Hang up the call via phone provider
     if (state.callControlId) {
       await this.config.providers.phone.hangup(state.callControlId);
     }
 
-    // Close sessions
+    // Close sessions and clean up mappings
     state.sttSession?.close();
     state.ws?.close();
     state.hungUp = true;
+
+    // Clean up security token mapping
+    this.wsTokenToCallId.delete(state.wsToken);
+    if (state.callControlId) {
+      this.callControlIdToCallId.delete(state.callControlId);
+    }
 
     const durationSeconds = Math.round((Date.now() - state.startTime) / 1000);
     this.activeCalls.delete(callId);
@@ -416,8 +512,12 @@ export class CallManager {
     const startTime = Date.now();
     while (Date.now() - startTime < timeout) {
       const state = this.activeCalls.get(callId);
-      // Wait for both WebSocket connection AND streamSid (needed for sending audio)
-      if (state?.ws && state.ws.readyState === WebSocket.OPEN && state.streamSid) {
+      // Wait for WebSocket AND streaming to be ready:
+      // - Twilio: streamSid is set from "start" WebSocket event
+      // - Telnyx: streamingReady is set from "streaming.started" webhook
+      const wsReady = state?.ws && state.ws.readyState === WebSocket.OPEN;
+      const streamReady = state?.streamSid || state?.streamingReady;
+      if (wsReady && streamReady) {
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -447,12 +547,16 @@ export class CallManager {
     const chunkSize = 160;  // 20ms at 8kHz
     for (let i = 0; i < muLawData.length; i += chunkSize) {
       const chunk = muLawData.subarray(i, i + chunkSize);
-      if (state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
-        state.ws.send(JSON.stringify({
+      if (state.ws?.readyState === WebSocket.OPEN) {
+        // Send JSON-wrapped media (Twilio requires streamSid, Telnyx doesn't)
+        const message: Record<string, unknown> = {
           event: 'media',
-          streamSid: state.streamSid,
           media: { payload: chunk.toString('base64') },
-        }));
+        };
+        if (state.streamSid) {
+          message.streamSid = state.streamSid;
+        }
+        state.ws.send(JSON.stringify(message));
       }
       await new Promise((resolve) => setTimeout(resolve, 18));
     }
@@ -510,12 +614,16 @@ export class CallManager {
           const audioChunk = pendingMuLaw.subarray(0, OUTPUT_CHUNK_SIZE);
           pendingMuLaw = pendingMuLaw.subarray(OUTPUT_CHUNK_SIZE);
 
-          if (state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
-            state.ws.send(JSON.stringify({
+          if (state.ws?.readyState === WebSocket.OPEN) {
+            // Send JSON-wrapped media (Twilio requires streamSid, Telnyx doesn't)
+            const message: Record<string, unknown> = {
               event: 'media',
-              streamSid: state.streamSid,
               media: { payload: audioChunk.toString('base64') },
-            }));
+            };
+            if (state.streamSid) {
+              message.streamSid = state.streamSid;
+            }
+            state.ws.send(JSON.stringify(message));
           }
           await new Promise((resolve) => setTimeout(resolve, 18));
         }
@@ -523,12 +631,15 @@ export class CallManager {
     }
 
     // Send remaining audio
-    if (pendingMuLaw.length > 0 && state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
-      state.ws.send(JSON.stringify({
+    if (pendingMuLaw.length > 0 && state.ws?.readyState === WebSocket.OPEN) {
+      const message: Record<string, unknown> = {
         event: 'media',
-        streamSid: state.streamSid,
         media: { payload: pendingMuLaw.toString('base64') },
-      }));
+      };
+      if (state.streamSid) {
+        message.streamSid = state.streamSid;
+      }
+      state.ws.send(JSON.stringify(message));
     }
   }
 
@@ -539,12 +650,16 @@ export class CallManager {
     const chunkSize = 160;
     for (let i = 0; i < muLawData.length; i += chunkSize) {
       const chunk = muLawData.subarray(i, i + chunkSize);
-      if (state.ws?.readyState === WebSocket.OPEN && state.streamSid) {
-        state.ws.send(JSON.stringify({
+      if (state.ws?.readyState === WebSocket.OPEN) {
+        // Send JSON-wrapped media (Twilio requires streamSid, Telnyx doesn't)
+        const message: Record<string, unknown> = {
           event: 'media',
-          streamSid: state.streamSid,
           media: { payload: chunk.toString('base64') },
-        }));
+        };
+        if (state.streamSid) {
+          message.streamSid = state.streamSid;
+        }
+        state.ws.send(JSON.stringify(message));
       }
       await new Promise((resolve) => setTimeout(resolve, 18));
     }

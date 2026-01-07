@@ -36,12 +36,14 @@ Choose **one** of the following:
      - You can see your ngrok URL on the ngrok dashboard
    - Note your **Application ID** and **API Key**
 4. [Verify the phone number](https://portal.telnyx.com/#/numbers/verified-numbers) you want to receive calls at
+5. (Optional but recommended) Get your **Public Key** from Account Settings > Keys & Credentials for webhook signature verification
 
 **Environment variables for Telnyx:**
 ```bash
 CALLME_PHONE_PROVIDER=telnyx
 CALLME_PHONE_ACCOUNT_SID=<Application ID>
 CALLME_PHONE_AUTH_TOKEN=<API Key>
+CALLME_TELNYX_PUBLIC_KEY=<Public Key>  # Optional: enables webhook security
 ```
 
 </details>
@@ -101,6 +103,7 @@ Add these to `~/.claude/settings.json` (recommended) or export them in your shel
 | `CALLME_NGROK_DOMAIN` | - | Custom ngrok domain (paid feature) |
 | `CALLME_TRANSCRIPT_TIMEOUT_MS` | `180000` | Timeout for user speech (3 minutes) |
 | `CALLME_STT_SILENCE_DURATION_MS` | `800` | Silence duration to detect end of speech |
+| `CALLME_TELNYX_PUBLIC_KEY` | - | Telnyx public key for webhook signature verification (recommended) |
 
 ### 4. Install Plugin
 
