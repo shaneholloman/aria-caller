@@ -1,6 +1,6 @@
 # CallMe
 
-**Plugin that lets Claude Code call you on the phone.**
+**Minimal plugin that lets Claude Code call you on the phone.**
 
 Start a task, walk away. Your phone/watch rings when Claude is done, stuck, or needs a decision.
 
@@ -9,7 +9,7 @@ Start a task, walk away. Your phone/watch rings when Claude is done, stuck, or n
 - **Minimal plugin** - Does one thing: call you on the phone. No crazy setups.
 - **Multi-turn conversations** — Talk through decisions naturally.
 - **Works anywhere** — Smartphone, smartwatch, or even landline!
-- **Tool-use compatible** - Claude can e.g. do a web search while on a call with you.
+- **Tool-use composable** - Claude can e.g. do a web search while on a call with you.
 
 ---
 
