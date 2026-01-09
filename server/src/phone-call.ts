@@ -565,25 +565,26 @@ export class CallManager {
   }
 
   /**
-   * Send pre-generated mu-law audio to the call
+   * Send a single audio chunk to the phone via WebSocket
    */
+  private sendMediaChunk(state: CallState, audioData: Buffer): void {
+    if (state.ws?.readyState !== WebSocket.OPEN) return;
+    const message: Record<string, unknown> = {
+      event: 'media',
+      media: { payload: audioData.toString('base64') },
+    };
+    if (state.streamSid) {
+      message.streamSid = state.streamSid;
+    }
+    state.ws.send(JSON.stringify(message));
+  }
+
   private async sendPreGeneratedAudio(state: CallState, muLawData: Buffer): Promise<void> {
     console.error(`[${state.callId}] Sending pre-generated audio...`);
     const chunkSize = 160;  // 20ms at 8kHz
     for (let i = 0; i < muLawData.length; i += chunkSize) {
-      const chunk = muLawData.subarray(i, i + chunkSize);
-      if (state.ws?.readyState === WebSocket.OPEN) {
-        // Send JSON-wrapped media (Twilio requires streamSid, Telnyx doesn't)
-        const message: Record<string, unknown> = {
-          event: 'media',
-          media: { payload: chunk.toString('base64') },
-        };
-        if (state.streamSid) {
-          message.streamSid = state.streamSid;
-        }
-        state.ws.send(JSON.stringify(message));
-      }
-      await new Promise((resolve) => setTimeout(resolve, 18));
+      this.sendMediaChunk(state, muLawData.subarray(i, i + chunkSize));
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
     // Small delay to ensure audio finishes playing before listening
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -622,6 +623,22 @@ export class CallManager {
     const OUTPUT_CHUNK_SIZE = 160; // 20ms at 8kHz
     const SAMPLES_PER_RESAMPLE = 6; // 6 bytes (3 samples) at 24kHz -> 1 sample at 8kHz
 
+    // Jitter buffer: accumulate audio before starting playback to smooth out
+    // timing variations from network latency and burst delivery patterns
+    const JITTER_BUFFER_MS = 100; // Buffer 100ms of audio before starting
+    // 8000 samples/sec ÷ 1000 ms/sec = 8 samples per ms; mu-law is 1 byte per sample
+    const JITTER_BUFFER_SIZE = (8000 / 1000) * JITTER_BUFFER_MS; // 800 bytes at 8kHz mu-law
+    let playbackStarted = false;
+
+    // Helper to drain and send buffered mu-law audio in chunks
+    const drainBuffer = async () => {
+      while (pendingMuLaw.length >= OUTPUT_CHUNK_SIZE) {
+        this.sendMediaChunk(state, pendingMuLaw.subarray(0, OUTPUT_CHUNK_SIZE));
+        pendingMuLaw = pendingMuLaw.subarray(OUTPUT_CHUNK_SIZE);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
+
     for await (const chunk of synthesizeStream(text)) {
       pendingPcm = Buffer.concat([pendingPcm, chunk]);
 
@@ -635,36 +652,22 @@ export class CallManager {
         const muLaw = this.pcmToMuLaw(resampled);
         pendingMuLaw = Buffer.concat([pendingMuLaw, muLaw]);
 
-        while (pendingMuLaw.length >= OUTPUT_CHUNK_SIZE) {
-          const audioChunk = pendingMuLaw.subarray(0, OUTPUT_CHUNK_SIZE);
-          pendingMuLaw = pendingMuLaw.subarray(OUTPUT_CHUNK_SIZE);
-
-          if (state.ws?.readyState === WebSocket.OPEN) {
-            // Send JSON-wrapped media (Twilio requires streamSid, Telnyx doesn't)
-            const message: Record<string, unknown> = {
-              event: 'media',
-              media: { payload: audioChunk.toString('base64') },
-            };
-            if (state.streamSid) {
-              message.streamSid = state.streamSid;
-            }
-            state.ws.send(JSON.stringify(message));
-          }
-          await new Promise((resolve) => setTimeout(resolve, 18));
+        // Wait for jitter buffer to fill before starting playback
+        if (!playbackStarted && pendingMuLaw.length < JITTER_BUFFER_SIZE) {
+          continue;
         }
+        playbackStarted = true;
+
+        await drainBuffer();
       }
     }
 
-    // Send remaining audio
-    if (pendingMuLaw.length > 0 && state.ws?.readyState === WebSocket.OPEN) {
-      const message: Record<string, unknown> = {
-        event: 'media',
-        media: { payload: pendingMuLaw.toString('base64') },
-      };
-      if (state.streamSid) {
-        message.streamSid = state.streamSid;
-      }
-      state.ws.send(JSON.stringify(message));
+    // Send remaining audio (including any buffered audio for short messages)
+    await drainBuffer();
+
+    // Send any final partial chunk
+    if (pendingMuLaw.length > 0) {
+      this.sendMediaChunk(state, pendingMuLaw);
     }
   }
 
@@ -674,19 +677,8 @@ export class CallManager {
 
     const chunkSize = 160;
     for (let i = 0; i < muLawData.length; i += chunkSize) {
-      const chunk = muLawData.subarray(i, i + chunkSize);
-      if (state.ws?.readyState === WebSocket.OPEN) {
-        // Send JSON-wrapped media (Twilio requires streamSid, Telnyx doesn't)
-        const message: Record<string, unknown> = {
-          event: 'media',
-          media: { payload: chunk.toString('base64') },
-        };
-        if (state.streamSid) {
-          message.streamSid = state.streamSid;
-        }
-        state.ws.send(JSON.stringify(message));
-      }
-      await new Promise((resolve) => setTimeout(resolve, 18));
+      this.sendMediaChunk(state, muLawData.subarray(i, i + chunkSize));
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
   }
 
@@ -737,8 +729,15 @@ export class CallManager {
     const output = Buffer.alloc(outputSamples * 2);
 
     for (let i = 0; i < outputSamples; i++) {
-      const sample = pcmData.readInt16LE(i * 3 * 2);
-      output.writeInt16LE(sample, i * 2);
+      // Use linear interpolation instead of point-sampling to reduce artifacts
+      // For each output sample, average the 3 surrounding input samples
+      // This acts as a simple anti-aliasing low-pass filter
+      const baseIdx = i * 3;
+      const s0 = pcmData.readInt16LE(baseIdx * 2);
+      const s1 = baseIdx + 1 < inputSamples ? pcmData.readInt16LE((baseIdx + 1) * 2) : s0;
+      const s2 = baseIdx + 2 < inputSamples ? pcmData.readInt16LE((baseIdx + 2) * 2) : s1;
+      const interpolated = Math.round((s0 + s1 + s2) / 3);
+      output.writeInt16LE(interpolated, i * 2);
     }
 
     return output;
